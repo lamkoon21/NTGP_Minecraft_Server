@@ -210,23 +210,78 @@ int FindEmptySlot()
 }
 
 
-// ===========================================================================
-// 아래는 아직 구현하지 않은 함수다. 빌드가 되도록 빈 본문만 두었다.
-// 설명은 설계서의 서버 함수 표를 따른다. 구현할 때 (void) 줄과 TODO를 지운다.
-// ===========================================================================
-
 // ---------------------------------------------------------------------------
 // ClientThread : 접속마다 1개. arg = 슬롯 id (main()이 intptr_t로 바꿔 넘긴다)
 // ---------------------------------------------------------------------------
 // 맡은 소켓(g_players[id].sock)에서 recv() -> ExtractPacket() -> ProcessPacket()을 반복한다.
 // recv()가 0 이하면 g_cs 안에서 소켓을 닫고 슬롯을 비운 뒤,
 // 다른 접속자에게 SC_REMOVE_PLAYER를 보내고 끝낸다.
+//
+// 이 소켓을 닫고 슬롯을 비우는 곳은 이 스레드의 퇴장 처리뿐이다.
+// (main()의 CreateThread() 실패 처리는 이 스레드가 없을 때만 돈다)
+// 그래서 SendToAll()은 send()가 실패해도 소켓을 닫지 않는다. 닫으면 이 스레드가 닫힌 소켓으로 recv()하게 된다.
+// 끊긴 소켓은 이 스레드의 recv()도 실패하므로 결국 여기서 정리된다.
 DWORD WINAPI ClientThread(LPVOID arg)
 {
-    // TODO: 구현. 구현 전까지는 접속이 끊겨도 슬롯이 비워지지 않는다.
-    (void)arg;
+    const int id = static_cast<int>(reinterpret_cast<intptr_t>(arg));
+
+    // g_players는 공유 데이터라 g_cs 안에서 꺼낸다.
+    // 슬롯은 이 스레드가 비울 때까지 다른 접속에 넘어가지 않으므로, 꺼낸 소켓은 끝까지 이 스레드의 것이다.
+    EnterCriticalSection(&g_cs);
+    const SOCKET sock = g_players[id].sock;
+    LeaveCriticalSection(&g_cs);
+
+    // recv()로 받은 바이트를 쌓아 두는 버퍼 (protocol.h의 ExtractPacket 사용 예와 같다)
+    // 패킷을 다 꺼낸 뒤에는 len이 항상 MAX_PACKET_SIZE보다 작으므로, recv()에 줄 빈 공간이 0이 되지 않는다.
+    constexpr int BUF_SIZE = 4096;
+    char buf[BUF_SIZE];
+    int len = 0;
+
+    // 1) 받기 -> 조립 -> 처리 반복
+    //    recv()는 데이터가 올 때까지 이 스레드만 멈추므로 g_cs 밖에서 부른다.
+    //    recv()가 0이면 상대가 연결을 닫음, SOCKET_ERROR(-1)면 끊김(강제 종료 등)이다.
+    int received = 0;
+    while ((received = recv(sock, buf + len, BUF_SIZE - len, 0)) > 0) {
+        len += received;
+
+        // 한 번에 여러 패킷이 왔을 수 있으니 꺼낼 수 있는 만큼 꺼낸다.
+        // buf는 이 스레드만 쓰므로 ExtractPacket()은 g_cs 밖에서 하고, ProcessPacket()만 g_cs 안에서 한다.
+        char packet[MAX_PACKET_SIZE];
+        while (ExtractPacket(buf, len, packet)) {
+            EnterCriticalSection(&g_cs);
+            ProcessPacket(id, packet);
+            LeaveCriticalSection(&g_cs);
+        }
+    }
+
+    const int error = (received == SOCKET_ERROR) ? WSAGetLastError() : 0;   // 아래 closesocket(), send()가 덮어쓰기 전에 읽어 둔다
+
+    // 2) 퇴장 처리 : 소켓 닫기, 슬롯 비우기, 남은 접속자에게 SC_REMOVE_PLAYER
+    //    한 임계 영역 안에서 해서 main()의 입장 처리와 섞이지 않는다. 그래서 새 접속자는 나간 플레이어를
+    //    아예 모르거나, SC_ADD_PLAYER를 받은 뒤 SC_REMOVE_PLAYER까지 받는다.
+    EnterCriticalSection(&g_cs);
+    closesocket(g_players[id].sock);
+    g_players[id].sock = INVALID_SOCKET;
+    g_players[id].in_use = false;
+
+    SC_REMOVE_PLAYER_PACKET remove;
+    remove.id = static_cast<uint8_t>(id);
+    SendToAll(&remove, id);
+    LeaveCriticalSection(&g_cs);
+
+    if (error == 0)
+        std::cout << "[퇴장] id " << id << " : 클라이언트가 연결을 닫음\n";
+    else
+        std::cout << "[퇴장] id " << id << " : 연결 끊김, 오류 코드 " << error << '\n';
+
     return 0;
 }
+
+
+// ===========================================================================
+// 아래는 아직 구현하지 않은 함수다. 빌드가 되도록 빈 본문만 두었다.
+// 설명은 설계서의 서버 함수 표를 따른다. 구현할 때 (void) 줄과 TODO를 지운다.
+// ===========================================================================
 
 // ---------------------------------------------------------------------------
 // ProcessPacket : 받은 패킷 하나를 처리한다 (클라이언트 스레드, g_cs 안)
