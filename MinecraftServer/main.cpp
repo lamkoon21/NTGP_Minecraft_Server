@@ -1,64 +1,34 @@
-﻿// 게임 규칙 없이 위치와 블록 변경만 중계
+﻿// 서버 켜기 · 끄기 (main 스레드)
 //
-// 스레드 -
-//   메인 스레드        main()         : 접속을 받고 입장 처리
-//   클라이언트 스레드  ClientThread() : 접속마다 1개, 받은 패킷을 바로 중계
-//
-// 여러 스레드가 함께 쓰는 전역에는 g_ 접두사를 붙이고, 모두 g_cs 안에서만 다룬다.
-// send()도 모두 g_cs 안에서 해서, 두 스레드가 같은 소켓에 동시에 보내지 않게 한다.
-//
-// protocol.h는 클라이언트 저장소와 같은 파일, 수정시 같이 고쳐야함
+// main()은 초기화 후 AcceptThread와 LogicThread를 만들고 콘솔 명령(quit · status)만 기다린다.
+// quit이면 g_hQuitEvent를 켠다. 모든 스레드는 자기 흐름의 "종료 신호?"에서 스스로 끝나고,
+// main()은 그것을 기다린 뒤 소켓 · 핸들 · 임계 영역을 정리한다.
+// v.3에서 main()이 하던 접속 받기는 AcceptThread(net_io.cpp)로 옮겼다. 스레드와 임계 영역 전체 그림은 server.h 맨 위
 // ============================================================================
 
-#include "protocol.h"  
-#include <ws2tcpip.h>
-#include <cstdint>
+#include "server.h"
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
 #include <iostream>
-#include <map>
 #include <random>
-#include <tuple>
+#include <string>
 
 
 // ---------------------------------------------------------------------------
-// 공유 데이터 : 모두 g_cs 안에서만 읽고 쓰기
+// 공유 데이터
 // ---------------------------------------------------------------------------
-
-// 슬롯 번호 = 플레이어 id
-struct Player {
-    SOCKET      sock = INVALID_SOCKET;  // 이 플레이어와 연결된 소켓
-    bool        in_use = false;         // 슬롯 사용 여부
-    bool        has_moved = false;      // CS_MOVE_PLAYER를 한 번이라도 받았는지 (SC_ADD_PLAYER의 has_moved)
-    PlayerState state;                  // 마지막으로 받은 위치, 시선, 든 블록
-};
-
-Player g_players[MAX_PLAYERS];
-
-// 바뀐 블록 : 블록 월드 좌표 (x, y, z) -> 마지막으로 바뀐 BlockType. 좌표마다 마지막 변경 하나만
-std::map<std::tuple<int32_t, int32_t, int32_t>, uint8_t> g_worldDiff;
-
-// 월드 시드 : 서버를 시작할 때 한 번 정하고, 입장하는 클라이언트에게 SC_JOIN_OK로 보낸다.
-int32_t g_seed = 0;
-
-// 위의 공유 데이터와 모든 send()를 보호한다.
-CRITICAL_SECTION g_cs;
+HANDLE           g_hQuitEvent = nullptr;
+CRITICAL_SECTION g_logCS;
 
 
 // ---------------------------------------------------------------------------
-// 함수 선언
-// ---------------------------------------------------------------------------
-int FindEmptySlot();                              // 메인 스레드, g_cs 안
-DWORD WINAPI ClientThread(LPVOID arg);            // 클라이언트 스레드. arg = 슬롯 id
-void ProcessPacket(int id, const char* packet);   // 클라이언트 스레드, g_cs 안
-void SendJoinData(int id);                        // 메인 스레드, g_cs 안
-void SendToAll(const void* packet, int except);   // g_cs 안. except = 뺄 id, -1이면 전원
-
-
-// ---------------------------------------------------------------------------
-// main : 서버 시작, 접속 받기와 입장 처리
+// main : 서버 켜기 -> 콘솔 명령 -> 끄기
 // ---------------------------------------------------------------------------
 int main()
 {
     // 1) 윈속 초기화
+    //    스레드를 만들기 전까지는 출력하는 스레드가 하나뿐이라 Log() 대신 std::cerr를 쓴다
     WSADATA wsa;
     const int startup = WSAStartup(MAKEWORD(2, 2), &wsa);
     if (startup != 0) {
@@ -66,12 +36,20 @@ int main()
         return 1;
     }
 
-    // 2) 리슨 소켓 : socket() -> bind() -> listen()
+    // 2) 리슨 소켓 : socket() -> SO_REUSEADDR -> bind() -> listen()
     SOCKET listen_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_sock == INVALID_SOCKET) {
         std::cerr << "socket() 실패, 오류 코드 " << WSAGetLastError() << '\n';
         WSACleanup();
         return 1;
+    }
+
+    // 서버를 껐다가 바로 다시 켜도 bind()가 실패하지 않게 한다.
+    // Windows에서는 이 옵션 때문에 서버를 두 개 켜도 둘 다 bind()에 성공하므로, 서버는 하나만 켠다.
+    BOOL reuse = TRUE;
+    if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR,
+                   reinterpret_cast<const char*>(&reuse), sizeof(reuse)) == SOCKET_ERROR) {
+        std::cerr << "setsockopt(SO_REUSEADDR) 실패, 오류 코드 " << WSAGetLastError() << " (계속 진행)\n";
     }
 
     sockaddr_in serveraddr = {};
@@ -94,229 +72,191 @@ int main()
     }
 
     // 3) 월드 시드 : 싱글플레이의 dis(gen)과 같은 범위(0 ~ 1000)
+    //    켤 때마다 새로 만들고 파일로 남기지 않는다 (월드 변경 · 저장 위치도 서버를 끄면 사라진다).
+    //    LogicThread에 넘기면 이후로는 Logic만 쓴다 (입장 때 SC_JOIN_OK로 보냄)
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<int> dis(0, 1000);
-    g_seed = dis(gen);
+    const int32_t seed = dis(gen);
 
-    // 4) 임계 영역
-    InitializeCriticalSection(&g_cs);
+    // 4) 잠금 · 이벤트
+    //    종료 이벤트는 수동 리셋 : 한 번 켜면 기다리는 모든 스레드가 계속 켜진 것으로 본다
+    //    송신 이벤트는 자동 리셋 : 깨어난 Send 스레드가 한 번 보면 다시 꺼진다
+    //    슬롯마다의 sendCS와 송신 이벤트는 서버가 끝날 때까지 그 슬롯에 들어오는 세션들이 돌려 쓴다
+    InitializeCriticalSection(&g_logCS);
+    InitializeCriticalSection(&g_sessionCS);
+    InitializeCriticalSection(&g_inQueueCS);
 
-    // 콘솔에 현재 서버 정보 표시, 필요시 주석 제거
-    //std::cout << "서버 시작 : 포트 " << SERVER_PORT << ", 월드 시드 " << g_seed
-    //          << ", 정원 " << MAX_PLAYERS << "명\n";
+    // CreateEvent (보안, 수동 ResetEvent 호출 여부, 초기상태, 이벤트 객체 이름 설정)
+    g_hQuitEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    bool ok = (g_hQuitEvent != nullptr);
+    for (Session& s : g_sessions) {
+        InitializeCriticalSection(&s.sendCS);
+        s.hSendEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        if (s.hSendEvent == nullptr)
+            ok = false;
+    }
+    if (!ok)
+        Log("CreateEvent() 실패");
 
-    // 5) 접속 받기
-    while (true) {
-        sockaddr_in clientaddr = {};
-        int addrlen = sizeof(clientaddr);
-        SOCKET client_sock = accept(listen_sock, reinterpret_cast<sockaddr*>(&clientaddr), &addrlen);
-        if (client_sock == INVALID_SOCKET) {
-            std::cerr << "accept() 실패, 오류 코드 " << WSAGetLastError() << '\n';
-            continue;
+    // 이 아래로는 실패해도 바로 return하지 않고 7)의 종료 · 정리를 거친다 (ok = false)
+
+    // 5) Accept · Logic 스레드 만들기
+    //    리슨 소켓은 Accept에게, 시드는 Logic에게 인자로 넘긴다
+    HANDLE hAccept = nullptr;
+    HANDLE hLogic = nullptr;
+    if (ok) {
+        hAccept = CreateThread(nullptr, 0, AcceptThread, reinterpret_cast<LPVOID>(listen_sock), 0, nullptr);
+        if (hAccept != nullptr)
+            hLogic = CreateThread(nullptr, 0, LogicThread,
+                                  reinterpret_cast<LPVOID>(static_cast<intptr_t>(seed)), 0, nullptr);
+
+        if (hAccept == nullptr || hLogic == nullptr) {
+            Log("CreateThread() 실패, 오류 코드 %lu", GetLastError());
+            ok = false;
         }
-
-        char ip[INET_ADDRSTRLEN] = {};
-        inet_ntop(AF_INET, &clientaddr.sin_addr, ip, sizeof(ip));
-        const int port = ntohs(clientaddr.sin_port);
-
-        // 이동 패킷이 1/60초마다 작게 오간다. Nagle 알고리즘을 끄지 않으면
-        // 작은 패킷을 모았다가 보내서 중계가 늦어지므로 TCP_NODELAY를 켠다.
-        BOOL nodelay = TRUE;
-        if (setsockopt(client_sock, IPPROTO_TCP, TCP_NODELAY,
-                       reinterpret_cast<const char*>(&nodelay), sizeof(nodelay)) == SOCKET_ERROR) {
-            std::cerr << "setsockopt(TCP_NODELAY) 실패, 오류 코드 " << WSAGetLastError() << " (계속 진행)\n";
-        }
-
-        // 6) 빈 슬롯 찾기부터 입장 알림까지 한 임계 영역 안에서 한다.
-        //    그래서 두 명이 동시에 들어와도 같은 슬롯을 받지 않고,
-        //    새 접속자는 입장 데이터를 다 받은 뒤에야 그 이후의 변경을 받는다.
-        EnterCriticalSection(&g_cs);
-
-        const int id = FindEmptySlot();
-        if (id == -1) {
-            LeaveCriticalSection(&g_cs);
-            closesocket(client_sock);   // 클라이언트는 recv()가 0을 받아 접속 실패로 처리한다
-            std::cout << "[접속 거절] " << ip << ':' << port << " : 정원(" << MAX_PLAYERS << "명) 초과\n";
-            continue;
-        }
-
-        // 슬롯에 등록
-        g_players[id].sock = client_sock;
-        g_players[id].in_use = true;
-        g_players[id].has_moved = false;
-        g_players[id].state = PlayerState{};
-
-        // 새 접속자에게 : SC_JOIN_OK, 바뀐 블록, 기존 플레이어
-        SendJoinData(id);
-
-        // 다른 접속자에게 : 새 플레이어. 아직 움직인 적이 없으므로 has_moved = 0
-        SC_ADD_PLAYER_PACKET add;
-        add.id = static_cast<uint8_t>(id);
-        add.has_moved = 0;
-        SendToAll(&add, id);
-
-        LeaveCriticalSection(&g_cs);
-
-        std::cout << "[접속] " << ip << ':' << port << " -> id " << id << '\n';
-
-        // 7) 이 접속을 맡을 클라이언트 스레드를 만든다.
-        //    슬롯 번호(id)를 넘기고, 소켓은 스레드가 g_players[id].sock에서 꺼낸다.
-        HANDLE thread = CreateThread(nullptr, 0, ClientThread,
-                                     reinterpret_cast<LPVOID>(static_cast<intptr_t>(id)), 0, nullptr);
-        if (thread == nullptr) {
-            std::cerr << "CreateThread() 실패, 오류 코드 " << GetLastError() << " : id " << id << " 연결을 닫음\n";
-
-            // 다른 접속자에게 이미 SC_ADD_PLAYER를 보냈으므로 퇴장 처리까지 한다
-            EnterCriticalSection(&g_cs);
-            closesocket(g_players[id].sock);
-            g_players[id].sock = INVALID_SOCKET;
-            g_players[id].in_use = false;
-
-            SC_REMOVE_PLAYER_PACKET remove;
-            remove.id = static_cast<uint8_t>(id);
-            SendToAll(&remove, id);
-            LeaveCriticalSection(&g_cs);
-            continue;
-        }
-
-        // 스레드가 끝나기를 기다리지 않으므로 핸들만 바로 닫는다 (스레드는 계속 돈다)
-        CloseHandle(thread);
     }
 
-    // 위 반복은 끝나지 않는다 (서버는 콘솔 창을 닫아 끝낸다).
-    // 반복을 끝내는 조건을 넣게 되면 아래 순서로 정리한다.
+    // 6) 콘솔 명령 기다리기 : quit = 종료, status = 상태 보기
+    //    입력이 끝나도(Ctrl+Z 후 Enter) quit으로 본다
+    if (ok) {
+        Log("서버 시작 : 포트 %d, 월드 시드 %d, 정원 %d명 (명령 : quit, status)", SERVER_PORT, seed, MAX_PLAYERS);
+
+        std::string command;
+        while (std::getline(std::cin, command) && command != "quit") {
+            if (command == "status")
+                PrintStatus();
+            else if (!command.empty())
+                Log("알 수 없는 명령 : %s (quit, status)", command.c_str());
+        }
+    }
+
+    // 7) 종료 : 종료 이벤트를 켜고 모든 스레드가 스스로 끝나길 기다린다
+    //    Accept · Logic을 먼저 기다린다. 둘이 끝나면 세션 표를 바꾸는 스레드가 없으므로
+    //    그다음에 남은 Recv · Send 핸들을 모아서 기다린다.
+    //    (Send가 받지 못하는 클라이언트에게 send() 중이면 SO_SNDTIMEO(5분)까지 늦어질 수 있다)
+    Log("서버 종료 중...");
+    if (g_hQuitEvent != nullptr)
+        SetEvent(g_hQuitEvent);
+
+    HANDLE threads[MAX_PLAYERS * 2];
+    DWORD count = 0;
+    if (hAccept != nullptr) threads[count++] = hAccept;
+    if (hLogic != nullptr)  threads[count++] = hLogic;
+    if (count > 0)
+        WaitForMultipleObjects(count, threads, TRUE, INFINITE);
+
+    count = 0;
+    EnterCriticalSection(&g_sessionCS);
+    for (const Session& s : g_sessions) {
+        if (s.hRecvThread != nullptr) threads[count++] = s.hRecvThread;
+        if (s.hSendThread != nullptr) threads[count++] = s.hSendThread;
+    }
+    LeaveCriticalSection(&g_sessionCS);
+    if (count > 0)
+        WaitForMultipleObjects(count, threads, TRUE, INFINITE);
+
+    // 8) 정리 : 남은 스레드가 없으므로 잠금 없이 닫는다
+    //    CleanupClients()가 아직 회수하지 못한 세션도 여기서 닫는다
+    for (Session& s : g_sessions) {
+        if (s.sock != INVALID_SOCKET)  closesocket(s.sock);
+        if (s.hRecvThread != nullptr)  CloseHandle(s.hRecvThread);
+        if (s.hSendThread != nullptr)  CloseHandle(s.hSendThread);
+        if (s.hSendEvent != nullptr)   CloseHandle(s.hSendEvent);
+        DeleteCriticalSection(&s.sendCS);
+    }
     closesocket(listen_sock);
-    DeleteCriticalSection(&g_cs);
+    if (hAccept != nullptr)      CloseHandle(hAccept);
+    if (hLogic != nullptr)       CloseHandle(hLogic);
+    if (g_hQuitEvent != nullptr) CloseHandle(g_hQuitEvent);
+
+    Log("서버 종료");
+    DeleteCriticalSection(&g_inQueueCS);
+    DeleteCriticalSection(&g_sessionCS);
+    DeleteCriticalSection(&g_logCS);    // Log()가 쓰므로 맨 마지막
     WSACleanup();
-    return 0;
+    return ok ? 0 : 1;
 }
 
 
 // ---------------------------------------------------------------------------
-// FindEmptySlot : g_players에서 비어 있는 첫 슬롯 번호를 찾는다
+// Log : printf 형식으로 한 줄 출력한다 (모든 스레드, g_logCS 안)
 // ---------------------------------------------------------------------------
-// 반드시 g_cs 안에서 부른다. main()이 같은 임계 영역 안에서 바로 등록하므로
-// 두 명이 동시에 접속해도 같은 슬롯을 받지 않는다.
-// 찾기만 하고 g_players는 바꾸지 않는다.
-// 반환 : 0 ~ MAX_PLAYERS - 1 = 빈 슬롯 번호, -1 = 빈 슬롯 없음 (정원 초과)
-int FindEmptySlot()
-{
-    for (int i = 0; i < MAX_PLAYERS; ++i) {
-        if (!g_players[i].in_use)
-            return i;
-    }
-    return -1;
-}
-
-
-// ---------------------------------------------------------------------------
-// ClientThread : 접속마다 1개. arg = 슬롯 id (main()이 intptr_t로 바꿔 넘긴다)
-// ---------------------------------------------------------------------------
-// 맡은 소켓(g_players[id].sock)에서 recv() -> ExtractPacket() -> ProcessPacket()을 반복한다.
-// recv()가 0 이하면 g_cs 안에서 소켓을 닫고 슬롯을 비운 뒤,
-// 다른 접속자에게 SC_REMOVE_PLAYER를 보내고 끝낸다.
+// fmt, ... : printf와 같다. 끝에 '\n'을 넣지 않는다 (Log가 붙인다)
+// 출력 꼴  : [시:분:초.밀리초] 내용
 //
-// 이 소켓을 닫고 슬롯을 비우는 곳은 이 스레드의 퇴장 처리뿐이다.
-// (main()의 CreateThread() 실패 처리는 이 스레드가 없을 때만 돈다)
-// 그래서 SendToAll()은 send()가 실패해도 소켓을 닫지 않는다. 닫으면 이 스레드가 닫힌 소켓으로 recv()하게 된다.
-// 끊긴 소켓은 이 스레드의 recv()도 실패하므로 결국 여기서 정리된다.
-DWORD WINAPI ClientThread(LPVOID arg)
+// 줄은 잠금 밖에서 다 만들고, g_logCS 안에서는 puts() · fflush()만 한다.
+// 그래서 여러 스레드가 동시에 불러도 한 줄이 섞이지 않고, 잠금을 잡는 시간이 짧다.
+// LOG_LINE_SIZE를 넘는 줄은 잘라서 끝을 "..."으로 바꾼다 (잘린 줄임을 알 수 있게).
+// 다른 잠금(g_sessionCS · g_inQueueCS · sendCS) 안에서 부르지 않는다. 잠금을 겹쳐 잡지 않기 위해서다.
+// g_logCS는 main()이 스레드를 만들기 전에 만들고 모든 스레드가 끝난 뒤 지운다. 그 밖에서는 std::cerr를 쓴다.
+// 콘솔 출력은 느리므로 매 틱 · 매 패킷처럼 자주 부르지 않는다.
+void Log(const char* fmt, ...)
 {
-    const int id = static_cast<int>(reinterpret_cast<intptr_t>(arg));
+    constexpr int LOG_LINE_SIZE = 512;   // 시각 + 내용 + '\0'
 
-    // g_players는 공유 데이터라 g_cs 안에서 꺼낸다.
-    // 슬롯은 이 스레드가 비울 때까지 다른 접속에 넘어가지 않으므로, 꺼낸 소켓은 끝까지 이 스레드의 것이다.
-    EnterCriticalSection(&g_cs);
-    const SOCKET sock = g_players[id].sock;
-    LeaveCriticalSection(&g_cs);
+    // 1) 잠금 밖에서 한 줄 만들기 : 시각 + 내용
+    SYSTEMTIME now;
+    GetLocalTime(&now);
 
-    // recv()로 받은 바이트를 쌓아 두는 버퍼 (protocol.h의 ExtractPacket 사용 예와 같다)
-    // 패킷을 다 꺼낸 뒤에는 len이 항상 MAX_PACKET_SIZE보다 작으므로, recv()에 줄 빈 공간이 0이 되지 않는다.
-    constexpr int BUF_SIZE = 4096;
-    char buf[BUF_SIZE];
-    int len = 0;
+    char line[LOG_LINE_SIZE];
+    const int prefix = std::snprintf(line, sizeof(line), "[%02d:%02d:%02d.%03d] ",
+                                     now.wHour, now.wMinute, now.wSecond, now.wMilliseconds);
+    va_list args;
+    va_start(args, fmt);
+    const int body = std::vsnprintf(line + prefix, sizeof(line) - prefix, fmt, args);
+    va_end(args);
 
-    // 1) 받기 -> 조립 -> 처리 반복
-    //    recv()는 데이터가 올 때까지 이 스레드만 멈추므로 g_cs 밖에서 부른다.
-    //    recv()가 0이면 상대가 연결을 닫음, SOCKET_ERROR(-1)면 끊김(강제 종료 등)이다.
-    int received = 0;
-    while ((received = recv(sock, buf + len, BUF_SIZE - len, 0)) > 0) {
-        len += received;
+    // vsnprintf는 잘렸을 때도 "다 썼다면 몇 글자였을지"를 돌려준다. 남은 칸보다 크면 잘린 것이다
+    if (body >= LOG_LINE_SIZE - prefix)
+        std::memcpy(line + LOG_LINE_SIZE - 4, "...", 4);   // 끝 세 글자를 "..."으로 ('\0'까지 4바이트)
 
-        // 한 번에 여러 패킷이 왔을 수 있으니 꺼낼 수 있는 만큼 꺼낸다.
-        // buf는 이 스레드만 쓰므로 ExtractPacket()은 g_cs 밖에서 하고, ProcessPacket()만 g_cs 안에서 한다.
-        char packet[MAX_PACKET_SIZE];
-        while (ExtractPacket(buf, len, packet)) {
-            EnterCriticalSection(&g_cs);
-            ProcessPacket(id, packet);
-            LeaveCriticalSection(&g_cs);
-        }
+    // 2) 잠금 안에서는 출력만
+    EnterCriticalSection(&g_logCS);
+    std::puts(line);
+    std::fflush(stdout);
+    LeaveCriticalSection(&g_logCS);
+}
+
+
+// ---------------------------------------------------------------------------
+// PrintStatus : status 명령. 서버 상태를 출력한다 (main 스레드)
+// ---------------------------------------------------------------------------
+// 틱 번호, 틱 처리 평균 · 최대 시간, 입력 큐 길이, 세션별 상태와 송신 대기 바이트
+// 잠금을 겹쳐 잡지 않도록 자료마다 따로 잠가 값만 복사하고, 출력은 잠금 밖에서 한다.
+void PrintStatus()
+{
+    static const char* const STATE_NAMES[] = { "FREE", "JOINING", "PLAYING", "CLOSING" };
+
+    // 1) 세션 표
+    SessionState states[MAX_PLAYERS];
+    uint32_t gens[MAX_PLAYERS];
+    EnterCriticalSection(&g_sessionCS);
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
+        states[i] = g_sessions[i].state;
+        gens[i] = g_sessions[i].gen;
+    }
+    LeaveCriticalSection(&g_sessionCS);
+
+    // 2) 세션마다 송신 대기 바이트
+    size_t pending[MAX_PLAYERS];
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
+        EnterCriticalSection(&g_sessions[i].sendCS);
+        pending[i] = g_sessions[i].sendBuf.size();
+        LeaveCriticalSection(&g_sessions[i].sendCS);
     }
 
-    const int error = (received == SOCKET_ERROR) ? WSAGetLastError() : 0;   // 아래 closesocket(), send()가 덮어쓰기 전에 읽어 둔다
+    // 3) 입력 큐 길이
+    EnterCriticalSection(&g_inQueueCS);
+    const size_t queued = g_inQueue.size();
+    LeaveCriticalSection(&g_inQueueCS);
 
-    // 2) 퇴장 처리 : 소켓 닫기, 슬롯 비우기, 남은 접속자에게 SC_REMOVE_PLAYER
-    //    한 임계 영역 안에서 해서 main()의 입장 처리와 섞이지 않는다. 그래서 새 접속자는 나간 플레이어를
-    //    아예 모르거나, SC_ADD_PLAYER를 받은 뒤 SC_REMOVE_PLAYER까지 받는다.
-    EnterCriticalSection(&g_cs);
-    closesocket(g_players[id].sock);
-    g_players[id].sock = INVALID_SOCKET;
-    g_players[id].in_use = false;
-
-    SC_REMOVE_PLAYER_PACKET remove;
-    remove.id = static_cast<uint8_t>(id);
-    SendToAll(&remove, id);
-    LeaveCriticalSection(&g_cs);
-
-    if (error == 0)
-        std::cout << "[퇴장] id " << id << " : 클라이언트가 연결을 닫음\n";
-    else
-        std::cout << "[퇴장] id " << id << " : 연결 끊김, 오류 코드 " << error << '\n';
-
-    return 0;
-}
-
-
-// ===========================================================================
-// 아래는 아직 구현하지 않은 함수다. 빌드가 되도록 빈 본문만 두었다.
-// 설명은 설계서의 서버 함수 표를 따른다. 구현할 때 (void) 줄과 TODO를 지운다.
-// ===========================================================================
-
-// ---------------------------------------------------------------------------
-// ProcessPacket : 받은 패킷 하나를 처리한다 (클라이언트 스레드, g_cs 안)
-// ---------------------------------------------------------------------------
-// CS_MOVE_PLAYER  : g_players[id]에 state 저장, has_moved = true,
-//                   보낸 사람을 뺀 접속자에게 SC_MOVE_PLAYER로 중계
-// CS_BLOCK_CHANGE : 좌표(청크 -19 ~ 19, 높이 0 ~ 127)와 블록 종류를 검사한 뒤
-//                   g_worldDiff에 기록하고, 보낸 사람을 포함한 전원에게 SC_BLOCK_CHANGE
-void ProcessPacket(int id, const char* packet)
-{
-    // TODO: 구현
-    (void)id;
-    (void)packet;
-}
-
-// ---------------------------------------------------------------------------
-// SendJoinData : 새 접속자에게 입장 데이터를 보낸다 (메인 스레드, g_cs 안)
-// ---------------------------------------------------------------------------
-// SC_JOIN_OK(id, g_seed) 1개, g_worldDiff의 바뀐 칸마다 SC_BLOCK_CHANGE,
-// 기존 플레이어마다 마지막 상태를 담은 SC_ADD_PLAYER를 보낸다.
-// main()이 슬롯을 등록한 뒤에 부르므로, 기존 플레이어를 보낼 때 자기 자신(id)은 뺀다.
-void SendJoinData(int id)
-{
-    // TODO: 구현
-    (void)id;
-}
-
-// ---------------------------------------------------------------------------
-// SendToAll : 사용 중인 모든 슬롯에 같은 패킷을 보낸다 (g_cs 안)
-// ---------------------------------------------------------------------------
-// except : 뺄 접속자 id. -1이면 전원에게 보낸다.
-// 이동 중계와 입퇴장 알림은 당사자를 빼고, 블록 변경은 전원에게 보낸다.
-void SendToAll(const void* packet, int except)
-{
-    // TODO: 구현
-    (void)packet;
-    (void)except;
+    // 4) 출력
+    Log("틱 %u, 틱 처리 평균 %.2fms / 최대 %.2fms, 입력 큐 %zu건",
+        g_tickStats.tick.load(), g_tickStats.avgUs.load() / 1000.0, g_tickStats.maxUs.load() / 1000.0, queued);
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
+        const bool closing = (states[i] != SessionState::FREE) && g_sessions[i].closing.load();
+        Log("  슬롯 %d : %-7s 세대 %u, 송신 대기 %zu바이트%s",
+            i, STATE_NAMES[static_cast<int>(states[i])], gens[i], pending[i], closing ? " (끊는 중)" : "");
+    }
 }
