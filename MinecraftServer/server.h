@@ -3,7 +3,8 @@
 // ============================================================================
 // 파일
 //   protocol.h   패킷 약속. 클라이언트 저장소와 같은 파일, 수정시 같이 고쳐야함
-//   server.h     서버 파일들이 함께 쓰는 선언 (이 파일)
+//   server.h     서버 파일들이 함께 쓰는 선언 (이 파일). session.h를 include한다
+//   session.h    세션 표 Session · g_sessions와 session.cpp의 함수 선언
 //   main.cpp     켜기 · 끄기, 콘솔 명령, 로그
 //   net_io.cpp   Accept · Recv · Send 스레드
 //   session.cpp  세션 표 · 송신 버퍼
@@ -32,7 +33,7 @@
 #define SERVER_H
 
 #include "protocol.h"
-#include <ws2tcpip.h>   // INET_ADDRSTRLEN
+#include "session.h"    // 세션 표 (Session · g_sessions · g_sessionCS)와 session.cpp의 함수 선언
 #include <atomic>
 #include <cstdint>
 #include <vector>
@@ -49,37 +50,17 @@ constexpr size_t MAX_SEND_BUFFER = 1024 * 1024;     // 송신 대기가 1MB를 �
 
 
 // ---------------------------------------------------------------------------
-// 세션 표 : 슬롯 번호 = 플레이어 id
+// 세션 표 : session.h
 // ---------------------------------------------------------------------------
-// FREE -> JOINING (OpenSession, 접속 받음) -> PLAYING (HandleHello, 입장 데이터 예약)
-//      -> CLOSING (HandleLeave) -> FREE (CleanupClients, Recv · Send가 모두 끝난 뒤)
-enum class SessionState : uint8_t { FREE, JOINING, PLAYING, CLOSING };
-
-struct Session {
-    // g_sessionCS 안에서 읽고 쓴다
-    SessionState state = SessionState::FREE;
-    SOCKET   sock = INVALID_SOCKET;
-    char     ip[INET_ADDRSTRLEN] = {};      // 상대 IPv4 주소 문자열. 재접속 위치를 찾는 열쇠 (HandleHello가 찾고 HandleLeave가 기록)
-    uint32_t gen = 0;                       // 세대 번호. OpenSession()마다 +1. 이미 정리된 세션이 늦게 넣은 입력을 가려낸다
-    HANDLE   hRecvThread = nullptr;
-    HANDLE   hSendThread = nullptr;
-
-    // sendCS 안에서 읽고 쓴다
-    CRITICAL_SECTION  sendCS;
-    std::vector<char> sendBuf;              // Logic이 이어 붙이고(QueuePacket), Send가 통째로 꺼낸다
-
-    // 잠금 없이 쓴다
-    HANDLE hSendEvent = nullptr;            // 자동 리셋. "보낼 것이 생겼다". main()이 만들고 끝날 때 닫는다
-    std::atomic<bool> closing{ false };     // RequestDisconnect()가 켠다. Recv · Send가 보고 스스로 끝난다
-};
-
-extern Session          g_sessions[MAX_PLAYERS];
-extern CRITICAL_SECTION g_sessionCS;
+// Session · SessionState · g_sessions · g_sessionCS와 session.cpp의 함수 선언은 session.h에 있다.
+// 상태가 바뀌는 순서와 필드마다 지키는 잠금도 session.h 맨 위에 적었다.
 
 
 // ---------------------------------------------------------------------------
 // 입력 큐 : Recv -> Logic
 // ---------------------------------------------------------------------------
+// Recv가 PushInput()으로 한 건씩 넣고, Logic이 틱마다 swap으로 통째로 꺼낸다.
+// 같은 세션의 입력은 넣은 순서대로 꺼내지므로 LEAVE는 항상 그 세션의 마지막 입력이다.
 enum class InputKind : uint8_t { PACKET, LEAVE };
 
 struct InputMsg {
@@ -87,6 +68,7 @@ struct InputMsg {
     uint32_t  gen = 0;                      // 넣을 때의 세대 번호. 지금 슬롯의 것과 다르면 Logic이 버린다
     InputKind kind = InputKind::PACKET;     // PACKET = 받은 패킷, LEAVE = 연결이 끝남
     char      packet[MAX_PACKET_SIZE] = {}; // kind가 PACKET일 때만. 헤더부터 시작하는 패킷 하나
+                                            // 헤더의 size만큼만 채우고 나머지는 0이다 (LEAVE면 모두 0)
 };
 
 extern std::vector<InputMsg> g_inQueue;
@@ -123,13 +105,7 @@ DWORD WINAPI RecvThread(LPVOID arg);                    // Recv 스레드. arg =
 void PushInput(int id, uint32_t gen, InputKind kind, const char* packet);   // Recv 스레드, g_inQueueCS
 DWORD WINAPI SendThread(LPVOID arg);                    // Send 스레드. arg = 슬롯 id
 
-// session.cpp
-int  FindEmptySlot();                                   // Accept 스레드, g_sessionCS 안에서 부른다
-int  OpenSession(SOCKET sock, const char* ip);          // Accept 스레드, g_sessionCS · sendCS (겹치지 않게)
-void QueuePacket(int id, const void* packet);           // Logic 스레드, sendCS
-void QueueToAll(const void* packet, int except);        // Logic 스레드. except = 뺄 id, -1이면 전원
-void RequestDisconnect(int id);                         // Recv · Send · Logic · Accept 스레드. 잠금 없음
-void CleanupClients();                                  // Logic 스레드, g_sessionCS
+// session.cpp : session.h에 선언 (FindEmptySlot · OpenSession · QueuePacket · QueueToAll · RequestDisconnect · CleanupClients)
 
 // logic.cpp
 DWORD WINAPI LogicThread(LPVOID arg);                   // Logic 스레드. arg = 월드 시드

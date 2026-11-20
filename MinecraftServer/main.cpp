@@ -9,6 +9,7 @@
 #include "server.h"
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <iostream>
 #include <random>
 #include <string>
@@ -179,23 +180,38 @@ int main()
 
 
 // ---------------------------------------------------------------------------
-// Log : printf 형식으로 한 줄 출력한다 (모든 스레드)
+// Log : printf 형식으로 한 줄 출력한다 (모든 스레드, g_logCS 안)
 // ---------------------------------------------------------------------------
-// 줄은 잠금 밖에서 만들고 출력만 g_logCS 안에서 해서, 여러 스레드의 로그가 한 줄에 섞이지 않게 한다.
-// 앞에 시각(시:분:초.밀리초)을 붙이고 끝에 줄바꿈을 붙인다. fmt에 '\n'을 넣지 않는다.
+// fmt, ... : printf와 같다. 끝에 '\n'을 넣지 않는다 (Log가 붙인다)
+// 출력 꼴  : [시:분:초.밀리초] 내용
+//
+// 줄은 잠금 밖에서 다 만들고, g_logCS 안에서는 puts() · fflush()만 한다.
+// 그래서 여러 스레드가 동시에 불러도 한 줄이 섞이지 않고, 잠금을 잡는 시간이 짧다.
+// LOG_LINE_SIZE를 넘는 줄은 잘라서 끝을 "..."으로 바꾼다 (잘린 줄임을 알 수 있게).
+// 다른 잠금(g_sessionCS · g_inQueueCS · sendCS) 안에서 부르지 않는다. 잠금을 겹쳐 잡지 않기 위해서다.
+// g_logCS는 main()이 스레드를 만들기 전에 만들고 모든 스레드가 끝난 뒤 지운다. 그 밖에서는 std::cerr를 쓴다.
+// 콘솔 출력은 느리므로 매 틱 · 매 패킷처럼 자주 부르지 않는다.
 void Log(const char* fmt, ...)
 {
+    constexpr int LOG_LINE_SIZE = 512;   // 시각 + 내용 + '\0'
+
+    // 1) 잠금 밖에서 한 줄 만들기 : 시각 + 내용
     SYSTEMTIME now;
     GetLocalTime(&now);
 
-    char line[512];
+    char line[LOG_LINE_SIZE];
     const int prefix = std::snprintf(line, sizeof(line), "[%02d:%02d:%02d.%03d] ",
                                      now.wHour, now.wMinute, now.wSecond, now.wMilliseconds);
     va_list args;
     va_start(args, fmt);
-    std::vsnprintf(line + prefix, sizeof(line) - prefix, fmt, args);
+    const int body = std::vsnprintf(line + prefix, sizeof(line) - prefix, fmt, args);
     va_end(args);
 
+    // vsnprintf는 잘렸을 때도 "다 썼다면 몇 글자였을지"를 돌려준다. 남은 칸보다 크면 잘린 것이다
+    if (body >= LOG_LINE_SIZE - prefix)
+        std::memcpy(line + LOG_LINE_SIZE - 4, "...", 4);   // 끝 세 글자를 "..."으로 ('\0'까지 4바이트)
+
+    // 2) 잠금 안에서는 출력만
     EnterCriticalSection(&g_logCS);
     std::puts(line);
     std::fflush(stdout);

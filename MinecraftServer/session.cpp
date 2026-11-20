@@ -3,9 +3,11 @@
 // 세션 하나 = 접속 한 건의 수명. OpenSession()이 열고 CleanupClients()가 닫는다.
 // Queue…는 송신 버퍼에 넣기만 하고 실제 send()는 그 세션의 Send 스레드가 한다.
 // g_sessionCS와 sendCS는 겹쳐 잡지 않는다.
+// 세션 표의 필드 · 상태가 바뀌는 순서 · 필드마다 지키는 잠금은 session.h 맨 위에 있다.
 // ============================================================================
 
-#include "server.h"
+#include "session.h"    // 이 파일이 구현하는 선언 (세션 표)
+#include "server.h"     // Log() · RecvThread · SendThread · MAX_SEND_BUFFER
 
 
 // ---------------------------------------------------------------------------
