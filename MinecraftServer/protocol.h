@@ -317,35 +317,24 @@ static_assert(sizeof(CS_PING_PACKET) == 3, "CS_PING_PACKET must be 3 bytes");
 // ---------------------------------------------------------------------------
 // ExtractPacket : recv()로 쌓아 둔 바이트에서 완성된 패킷 하나를 꺼낸다
 // ---------------------------------------------------------------------------
+enum ExtractResult {
+    EXTRACT_INCOMPLETE,  // 데이터 부족
+    EXTRACT_COMPLETE,    // 패킷 하나 추출 완료
+    EXTRACT_INVALID,     // 잘못된 패킷 크기
+};
+
 // buf : recv()로 받은 바이트를 이어 붙여 둔 버퍼. 앞에서부터 len바이트가 들어 있다.
 // len : buf에 들어 있는 바이트 수. 패킷을 꺼내면 그만큼 줄어든다 (그래서 참조로 받는다).
 // out : 꺼낸 패킷을 복사해 줄 곳. MAX_PACKET_SIZE바이트 이상이어야 한다.
-// 반환 : true  = 맨 앞 패킷이 다 모여서 out에 꺼냄, buf의 나머지는 앞으로 당겨짐
-//        false = 아직 덜 모여서 recv()를 더 해야 함, buf와 len은 그대로
-//
-// 사용 예 - (서버 ClientThread, 클라이언트 RecvThread)
-//     const int BUF_SIZE = 4096;                       // MAX_PACKET_SIZE보다 커야 한다
-//     char buf[BUF_SIZE];
-//     int len = 0;
-//     while (true) {
-//         int received = recv(sock, buf + len, BUF_SIZE - len, 0);
-//         if (received <= 0) break;                    // 0 이하 = 연결이 끊겼다
-//         len += received;
-//
-//         char packet[MAX_PACKET_SIZE];
-//         while (ExtractPacket(buf, len, packet)) {    // 한 번에 여러 개가 왔을 수 있으니 while
-//             ProcessPacket(id, packet);               // packet은 헤더부터 시작하는 패킷 하나
-//         }
-//     }
-//
-// 헤더의 size가 헤더보다 작거나 MAX_PACKET_SIZE보다 크면 데이터가 깨진 것
-// TCP에는 경계 표시가 없어서 한 번 어긋나면 다시 맞출 방법이 없으므로, 쌓인 바이트를 모두 버리고 false를 리턴
-// size가 0이면 같은 자리를 끝없이 꺼내고, 너무 크면 out 배열 밖을 덮어쓰게 되는데 그것을 막는다.
-inline bool ExtractPacket(char* buf, int& len, char* out)
+// 반환 : EXTRACT_INCOMPLETE = 데이터 부족, 버퍼 유지
+//        EXTRACT_COMPLETE = 패킷 추출 완료
+//        EXTRACT_INVALID = 잘못된 크기, 버퍼 초기화
+// EXTRACT_INVALID면 호출한 쪽에서 연결 종료
+inline ExtractResult ExtractPacket(char* buf, int& len, char* out)
 {
     // 1) 헤더 3바이트도 안 온 경우
     if (len < static_cast<int>(sizeof(PacketHeader)))
-        return false;
+        return EXTRACT_INCOMPLETE;
 
     // 2) 헤더에서 이 패킷의 전체 크기를 읽는다
     //    char 배열을 구조체 포인터로 바꿔 읽는 대신 지역 변수로 복사해서 읽는다
@@ -353,21 +342,41 @@ inline bool ExtractPacket(char* buf, int& len, char* out)
     memcpy(&header, buf, sizeof(header));
     const int size = header.size;
 
-    // 3) 너무 큰 경우
+    // 3) 잘못된 크기
     if (size < static_cast<int>(sizeof(PacketHeader)) || size > MAX_PACKET_SIZE) {
         len = 0;
-        return false;
+        return EXTRACT_INVALID;
     }
 
-    // 4) 패킷 끝까지 아직 안 온 경우 
+    // 4) 패킷 끝까지 아직 안 온 경우
     if (len < size)
-        return false;
+        return EXTRACT_INCOMPLETE;
 
     // 5) 완성된 패킷을 out에 복사하고, 뒤에 남은 바이트를 buf 맨 앞으로 당긴다.
     //    당길 때는 원본과 복사할 곳이 겹치므로 memcpy가 아니라 memmove를 쓴다.
     memcpy(out, buf, size);
     len -= size;
     memmove(buf, buf + size, len);
+    return EXTRACT_COMPLETE;
+}
+
+
+// 버퍼 전체 전송
+inline bool SendBuffer(SOCKET sock, const void* buffer, int len)
+{
+    // 입력값 검사
+    if (len < 0 || (buffer == nullptr && len > 0))
+        return false;
+
+    const char* data = static_cast<const char*>(buffer);
+    int sent = 0;
+    // 남은 데이터를 이어서 전송
+    while (sent < len) {
+        const int result = send(sock, data + sent, len - sent, 0);
+        if (result <= 0)
+            return false;
+        sent += result;
+    }
     return true;
 }
 
