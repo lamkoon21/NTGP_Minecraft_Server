@@ -172,9 +172,23 @@ void RequestDisconnect(int id)
 // g_sessionCS 안에서 PLAYING인 슬롯 번호만 복사하고, 잠금을 놓은 뒤 각각 QueuePacket()을 부른다 (잠금을 겹치지 않게).
 void QueueToAll(const void* packet, int except)
 {
-    // TODO: 구현
-    (void)packet;
-    (void)except;
+    if (packet == nullptr)
+        return;
+
+    int targets[MAX_PLAYERS];
+    int count = 0;
+
+    // 전송 대상 선택
+    EnterCriticalSection(&g_sessionCS);
+    for (int id = 0; id < MAX_PLAYERS; ++id) {
+        if (id != except && g_sessions[id].state == SessionState::PLAYING)
+            targets[count++] = id;
+    }
+    LeaveCriticalSection(&g_sessionCS);
+
+    // 잠금 해제 후 송신 큐에 등록
+    for (int i = 0; i < count; ++i)
+        QueuePacket(targets[i], packet);
 }
 
 // ---------------------------------------------------------------------------
