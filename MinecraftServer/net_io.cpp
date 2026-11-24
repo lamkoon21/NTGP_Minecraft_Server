@@ -188,11 +188,6 @@ void PushInput(int id, uint32_t gen, InputKind kind, const char* packet)
 }
 
 
-// ===========================================================================
-// 아래는 아직 구현하지 않은 함수다. 빌드가 되도록 빈 본문만 두었다.
-// 설명은 설계서의 서버 함수 표를 따른다. 구현할 때 (void) 줄과 TODO를 지운다.
-// ===========================================================================
-
 // ---------------------------------------------------------------------------
 // RecvThread : 자기 클라이언트의 패킷을 받아 입력 큐에 넣는다 (Recv 스레드, 세션마다 1개)
 // ---------------------------------------------------------------------------
@@ -204,11 +199,62 @@ void PushInput(int id, uint32_t gen, InputKind kind, const char* packet)
 // PushInput(LEAVE)와 RequestDisconnect()를 부른 뒤 끝난다.
 // 게임 상태를 만지지 않고 send()도 하지 않는다. 소켓도 닫지 않는다 (CleanupClients).
 // 받기 반복은 v.3의 ClientThread()와 같은 모양이다.
-// protocol.h(V2)의 ExtractPacket()은 bool이라 깨진 경우를 따로 알려 주지 않는다 (깨지면 len을 0으로 만든다).
+// ExtractPacket()이 EXTRACT_INVALID를 반환하면 패킷 경계가 깨진 것이므로 수신을 끝낸다.
 DWORD WINAPI RecvThread(LPVOID arg)
 {
-    // TODO: 구현
-    (void)arg;
+    const int id = static_cast<int>(reinterpret_cast<intptr_t>(arg));
+    if (id < 0 || id >= MAX_PLAYERS)
+        return 0;
+
+    Session& s = g_sessions[id];
+    EnterCriticalSection(&g_sessionCS);
+    const SOCKET sock = s.sock;
+    const uint32_t gen = s.gen;
+    LeaveCriticalSection(&g_sessionCS);
+
+    char buf[4096];
+    int len = 0;
+    bool receiving = true;
+    while (receiving && !s.closing.load() &&
+           WaitForSingleObject(g_hQuitEvent, 0) == WAIT_TIMEOUT) {
+        fd_set readset;
+        FD_ZERO(&readset);
+        FD_SET(sock, &readset);
+        timeval timeout = { 0, SELECT_TIMEOUT_MS * 1000 };
+        const int ready = select(0, &readset, nullptr, nullptr, &timeout);
+
+        if (s.closing.load() || WaitForSingleObject(g_hQuitEvent, 0) != WAIT_TIMEOUT)
+            break;
+        if (ready == SOCKET_ERROR)
+            break;
+        if (ready == 0)
+            continue;
+
+        const int received = recv(sock, buf + len, static_cast<int>(sizeof(buf)) - len, 0);
+        if (received <= 0)
+            break;
+        len += received;
+
+        while (!s.closing.load() && WaitForSingleObject(g_hQuitEvent, 0) == WAIT_TIMEOUT) {
+            char packet[MAX_PACKET_SIZE] = {};
+            const ExtractResult result = ExtractPacket(buf, len, packet);
+            if (result == EXTRACT_INCOMPLETE)
+                break;
+            if (result == EXTRACT_INVALID) {
+                receiving = false;
+                break;
+            }
+
+            PacketHeader header;
+            memcpy(&header, packet, sizeof(header));
+            if (header.type == CS_PING && header.size == sizeof(CS_PING_PACKET))
+                continue;
+            PushInput(id, gen, InputKind::PACKET, packet);
+        }
+    }
+
+    PushInput(id, gen, InputKind::LEAVE, nullptr);
+    RequestDisconnect(id);
     return 0;
 }
 
@@ -221,10 +267,48 @@ DWORD WINAPI RecvThread(LPVOID arg)
 // 이 클라이언트가 받지 못해 send()가 막혀도 기다리는 것은 이 스레드 하나뿐이다.
 // 보내기 실패(SO_SNDTIMEO 5분 시간 초과 포함)나 closing이면 RequestDisconnect()를 부르고 끝난다.
 // closing이어도 버퍼에 남은 것(버전 거절 SC_JOIN_REJECT 등)은 먼저 보내고 끝난다.
-// 설계안의 SendAll()(버퍼 단위 전송)은 protocol.h(V2)에 아직 없다. 지금 있는 SendPacket()은 패킷 하나 단위다.
+// 버퍼 전송은 SendBuffer() 사용
 DWORD WINAPI SendThread(LPVOID arg)
 {
-    // TODO: 구현
-    (void)arg;
+    const int id = static_cast<int>(reinterpret_cast<intptr_t>(arg));
+    if (id < 0 || id >= MAX_PLAYERS)
+        return 0;
+
+    Session& s = g_sessions[id];
+    EnterCriticalSection(&g_sessionCS);
+    const SOCKET sock = s.sock;
+    LeaveCriticalSection(&g_sessionCS);
+
+    const HANDLE events[] = { g_hQuitEvent, s.hSendEvent };
+    std::vector<char> buffer;
+    while (true) {
+        if (!s.closing.load()) {
+            const DWORD result = WaitForMultipleObjects(2, events, FALSE, INFINITE);
+            if (result != WAIT_OBJECT_0 + 1)
+                break;
+        }
+        if (WaitForSingleObject(g_hQuitEvent, 0) != WAIT_TIMEOUT)
+            break;
+
+        // 송신 버퍼 꺼내기
+        EnterCriticalSection(&s.sendCS);
+        buffer.swap(s.sendBuf);
+        LeaveCriticalSection(&s.sendCS);
+
+        if (!buffer.empty() && !SendBuffer(sock, buffer.data(), static_cast<int>(buffer.size())))
+            break;
+        buffer.clear();
+
+        // 남은 송신 버퍼 확인
+        if (s.closing.load()) {
+            EnterCriticalSection(&s.sendCS);
+            const bool empty = s.sendBuf.empty();
+            LeaveCriticalSection(&s.sendCS);
+            if (empty)
+                break;
+        }
+    }
+
+    RequestDisconnect(id);
     return 0;
 }
