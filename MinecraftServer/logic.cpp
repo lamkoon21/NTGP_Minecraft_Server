@@ -171,11 +171,6 @@ DWORD WINAPI LogicThread(LPVOID arg)
 }
 
 
-// ===========================================================================
-// 아래는 아직 구현하지 않은 함수다. 빌드가 되도록 빈 본문만 두었다.
-// 설명은 설계서의 서버 함수 표를 따른다. 구현할 때 (void) 줄과 TODO를 지운다.
-// ===========================================================================
-
 // ---------------------------------------------------------------------------
 // ProcessInput : 입력 한 건을 종류에 따라 Handle…()로 넘긴다
 // ---------------------------------------------------------------------------
@@ -183,11 +178,54 @@ DWORD WINAPI LogicThread(LPVOID arg)
 // 세대 번호가 다르거나 슬롯이 FREE면 이미 정리된 세션이 늦게 보낸 입력이므로 버린다.
 // LEAVE -> HandleLeave(), PACKET -> 패킷 종류에 따라 HandleHello() · HandleMove() · HandleBlockChange()
 // 패킷의 종류와 크기(header.size == sizeof(그 패킷))가 맞지 않아도 버린다.
+// 세션 상태에 맞지 않는 패킷도 버린다. CS_HELLO는 JOINING, CS_MOVE_PLAYER · CS_BLOCK_CHANGE는 PLAYING일 때만 넘긴다.
 void ProcessInput(const InputMsg& msg)
 {
-    // TODO: 구현
-    (void)msg;
+    if (msg.id < 0 || msg.id >= MAX_PLAYERS)
+        return;
+
+    // 1) 세대 번호 · 상태 읽기 : 잠금 안에서는 복사만
+    EnterCriticalSection(&g_sessionCS);
+    const uint32_t gen = g_sessions[msg.id].gen;
+    const SessionState state = g_sessions[msg.id].state;
+    LeaveCriticalSection(&g_sessionCS);
+
+    // 이미 정리된 세션이 늦게 보낸 입력은 버린다
+    if (msg.gen != gen || state == SessionState::FREE)
+        return;
+
+    // 2) 퇴장
+    if (msg.kind == InputKind::LEAVE) {
+        HandleLeave(msg.id);
+        return;
+    }
+
+    // 3) 패킷 : 종류 · 크기 · 세션 상태가 모두 맞을 때만 넘긴다
+    PacketHeader header;
+    memcpy(&header, msg.packet, sizeof(header));
+    switch (header.type) {
+    case CS_HELLO:          // 입장 전(JOINING)에만
+        if (header.size == sizeof(CS_HELLO_PACKET) && state == SessionState::JOINING)
+            HandleHello(msg.id, msg.packet);
+        break;
+    case CS_MOVE_PLAYER:    // 입장 뒤(PLAYING)에만
+        if (header.size == sizeof(CS_MOVE_PLAYER_PACKET) && state == SessionState::PLAYING)
+            HandleMove(msg.id, msg.packet);
+        break;
+    case CS_BLOCK_CHANGE:   // 입장 뒤(PLAYING)에만
+        if (header.size == sizeof(CS_BLOCK_CHANGE_PACKET) && state == SessionState::PLAYING)
+            HandleBlockChange(msg.id, msg.packet);
+        break;
+    default:                // 모르는 종류는 버린다
+        break;
+    }
 }
+
+
+// ===========================================================================
+// 아래는 아직 구현하지 않은 함수다. 빌드가 되도록 빈 본문만 두었다.
+// 설명은 설계서의 서버 함수 표를 따른다. 구현할 때 (void) 줄과 TODO를 지운다.
+// ===========================================================================
 
 // ---------------------------------------------------------------------------
 // HandleHello : CS_HELLO 처리
