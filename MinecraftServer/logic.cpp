@@ -1,6 +1,6 @@
 ﻿// Logic 스레드와 게임 상태
 //
-// 게임 상태(플레이어 · 바뀐 블록 · 시드 · 틱 번호)는 이 파일 안의 static이고 Logic 스레드만 읽고 쓴다.
+// 게임 상태(플레이어 · 바뀐 블록 · 시드 · 틱 번호 · IP별 저장 위치)는 이 파일 안의 static이고 Logic 스레드만 읽고 쓴다.
 // 만지는 스레드가 하나뿐이라 잠금이 없다.
 // 다른 스레드와는 입력 큐(g_inQueue)와 송신 버퍼(QueuePacket)로만 주고받는다.
 // ============================================================================
@@ -8,6 +8,7 @@
 #include "server.h"
 #include <chrono>
 #include <map>
+#include <string>
 #include <tuple>
 
 
@@ -24,7 +25,7 @@ TickStats g_tickStats;
 // 슬롯 번호 = 플레이어 id
 struct Player {
     bool        in_game = false;    // 게임 중 확인, HandleHello()에서 켜고 HandleLeave()에서 끈다 (세션의 PLAYING과 같이 움직임)
-    bool        has_moved = false;  // CS_MOVE_PLAYER를 한 번이라도 받았는지 (SC_ADD_PLAYER의 has_moved)
+    bool        has_moved = false;  // CS_MOVE_PLAYER를 한 번이라도 받았거나 저장 위치에서 시작했는지 (SC_ADD_PLAYER의 has_moved)
     PlayerState state;              // 마지막으로 받은 위치, 시선, 든 블록, 이동 모드
 };
 
@@ -38,6 +39,13 @@ static int32_t seed = 0;
 
 // 틱 번호 : 틱마다 +1. SC_SNAPSHOT에 넣는다
 static uint32_t tickNumber = 0;
+
+// 재접속 저장 위치 : 접속한 IP 주소 -> 나갈 때의 마지막 위치. HandleLeave()가 쓰고 HandleHello()가 찾는다
+// 위치만 기억한다. 시선 · 든 블록 · 이동 모드는 다시 들어와도 처음 값으로 시작한다
+struct SavedPosition {
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+};
+static std::map<std::string, SavedPosition> savedPositions;
 
 
 // ---------------------------------------------------------------------------
@@ -222,11 +230,6 @@ void ProcessInput(const InputMsg& msg)
 }
 
 
-// ===========================================================================
-// 아래는 아직 구현하지 않은 함수다. 빌드가 되도록 빈 본문만 두었다.
-// 설명은 설계서의 서버 함수 표를 따른다. 구현할 때 (void) 줄과 TODO를 지운다.
-// ===========================================================================
-
 // ---------------------------------------------------------------------------
 // HandleHello : CS_HELLO 처리
 // ---------------------------------------------------------------------------
@@ -237,10 +240,61 @@ void ProcessInput(const InputMsg& msg)
 // g_sessionCS 안에서 세션을 PLAYING으로 바꾼다.
 void HandleHello(int id, const char* packet)
 {
-    // TODO: 구현
-    (void)id;
-    (void)packet;
+    CS_HELLO_PACKET hello;
+    memcpy(&hello, packet, sizeof(hello));
+
+    // 1) 버전이 다르면 SC_JOIN_REJECT를 예약하고 끊는다
+    //    QueuePacket()은 끊는 중인 세션에 붙이지 않으므로 RequestDisconnect()보다 먼저 넣는다
+    if (hello.version != PROTOCOL_VERSION) {
+        SC_JOIN_REJECT_PACKET reject;
+        reject.reason = JOIN_REJECT_VERSION;
+        QueuePacket(id, &reject);
+        RequestDisconnect(id);
+        Log("[입장 거절] id %d : 프로토콜 버전 %d (서버 %d)", id, hello.version, PROTOCOL_VERSION);
+        return;
+    }
+
+    // 2) 그 세션의 IP로 저장 위치 찾기 : 잠금 안에서는 IP 복사만
+    char ip[INET_ADDRSTRLEN];
+    EnterCriticalSection(&g_sessionCS);
+    memcpy(ip, g_sessions[id].ip, sizeof(ip));
+    LeaveCriticalSection(&g_sessionCS);
+
+    Player& player = players[id];
+    player = Player{};   // 이 슬롯을 먼저 쓴 플레이어가 남긴 상태를 지운다
+    const auto saved = savedPositions.find(ip);
+    const bool hasSaved = (saved != savedPositions.end());
+    if (hasSaved) {
+        player.state.x = saved->second.x;
+        player.state.y = saved->second.y;
+        player.state.z = saved->second.z;
+        player.has_moved = true;
+    }
+
+    // 3) 입장 데이터 예약 -> 게임 중으로 표시
+    QueueJoinData(id);
+    player.in_game = true;
+
+    // 4) 다른 접속자에게 새 플레이어 알림
+    SC_ADD_PLAYER_PACKET add;
+    add.id = static_cast<uint8_t>(id);
+    add.has_moved = player.has_moved ? 1 : 0;
+    add.state = player.state;
+    QueueToAll(&add, id);
+
+    // 5) PLAYING으로 : 이제부터 스냅샷 · 블록 변경 · 입퇴장 알림을 받는다
+    EnterCriticalSection(&g_sessionCS);
+    g_sessions[id].state = SessionState::PLAYING;
+    LeaveCriticalSection(&g_sessionCS);
+
+    Log("[입장] id %d%s", id, hasSaved ? " : 저장 위치에서 시작" : "");
 }
+
+
+// ===========================================================================
+// 아래는 아직 구현하지 않은 함수다. 빌드가 되도록 빈 본문만 두었다.
+// 설명은 설계서의 서버 함수 표를 따른다. 구현할 때 (void) 줄과 TODO를 지운다.
+// ===========================================================================
 
 // ---------------------------------------------------------------------------
 // HandleMove : CS_MOVE_PLAYER 처리
