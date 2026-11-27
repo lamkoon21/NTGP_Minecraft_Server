@@ -6,6 +6,7 @@
 // ============================================================================
 
 #include "server.h"
+#include <chrono>
 #include <map>
 #include <tuple>
 
@@ -100,11 +101,6 @@ void QueueJoinData(int id)
 }
 
 
-// ===========================================================================
-// 아래는 아직 구현하지 않은 함수다. 빌드가 되도록 빈 본문만 두었다.
-// 설명은 설계서의 서버 함수 표를 따른다. 구현할 때 (void) 줄과 TODO를 지운다.
-// ===========================================================================
-
 // ---------------------------------------------------------------------------
 // LogicThread : 50ms마다 입력을 처리하고 결과를 송신 버퍼에 쓴다 (Logic 스레드, 1개)
 // ---------------------------------------------------------------------------
@@ -118,9 +114,67 @@ DWORD WINAPI LogicThread(LPVOID arg)
     // main()이 정한 시드를 게임 상태에 둔다. 이후로는 이 스레드만 읽는다 (QueueJoinData가 SC_JOIN_OK에 담음)
     seed = static_cast<int32_t>(reinterpret_cast<intptr_t>(arg));
 
-    // TODO: 구현 (틱 반복)
+    // 1) 틱 타이머 : 50ms 뒤에 처음 켜지고 이후 50ms마다 켜진다 (자동 리셋)
+    LARGE_INTEGER due;
+    due.QuadPart = -10000LL * SERVER_TICK_MS;   // 100ns 단위, 음수는 지금부터의 상대 시간
+    const HANDLE hTimer = CreateWaitableTimer(nullptr, FALSE, nullptr);
+    if (hTimer == nullptr || !SetWaitableTimer(hTimer, &due, SERVER_TICK_MS, nullptr, nullptr, FALSE)) {
+        Log("틱 타이머를 만들지 못함, 오류 코드 %lu : Logic 스레드를 끝냄", GetLastError());
+        if (hTimer != nullptr)
+            CloseHandle(hTimer);
+        return 1;
+    }
+
+    const HANDLE events[] = { g_hQuitEvent, hTimer };   // 둘 다 켜져 있으면 앞의 종료 이벤트를 먼저 본다
+    std::vector<InputMsg> inputs;                       // 틱마다 g_inQueue와 바꿔 쓴다
+    uint64_t totalUs = 0;                               // 평균을 내기 위한 처리 시간 합
+    uint32_t maxUs = 0;
+
+    while (true) {
+        // 2) 기다리기 -> 종료 신호?
+        const DWORD result = WaitForMultipleObjects(2, events, FALSE, INFINITE);
+        if (result == WAIT_OBJECT_0)
+            break;
+        if (result != WAIT_OBJECT_0 + 1) {
+            Log("WaitForMultipleObjects() 실패, 오류 코드 %lu : Logic 스레드를 끝냄", GetLastError());
+            break;
+        }
+        const auto start = std::chrono::steady_clock::now();
+
+        // 3) 입력 큐 통째로 꺼내기 : 잠금 안에서는 swap 한 번만
+        EnterCriticalSection(&g_inQueueCS);
+        inputs.swap(g_inQueue);
+        LeaveCriticalSection(&g_inQueueCS);
+
+        // 4) 받은 순서대로 처리 : 게임 상태는 이 스레드만 바꾸므로 잠금 없이
+        for (const InputMsg& msg : inputs)
+            ProcessInput(msg);
+        inputs.clear();
+
+        // 5) 끝난 세션 회수 -> 스냅샷 예약
+        CleanupClients();
+        BroadcastSnapshot(++tickNumber);
+
+        // 6) 틱 처리 시간 기록 (status 명령) : 평균은 서버를 켠 뒤 모든 틱의 평균
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        const uint32_t us = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count());
+        totalUs += us;
+        if (us > maxUs)
+            maxUs = us;
+        g_tickStats.avgUs = static_cast<uint32_t>(totalUs / tickNumber);
+        g_tickStats.maxUs = maxUs;
+        g_tickStats.tick = tickNumber;
+    }
+
+    CloseHandle(hTimer);
     return 0;
 }
+
+
+// ===========================================================================
+// 아래는 아직 구현하지 않은 함수다. 빌드가 되도록 빈 본문만 두었다.
+// 설명은 설계서의 서버 함수 표를 따른다. 구현할 때 (void) 줄과 TODO를 지운다.
+// ===========================================================================
 
 // ---------------------------------------------------------------------------
 // ProcessInput : 입력 한 건을 종류에 따라 Handle…()로 넘긴다
