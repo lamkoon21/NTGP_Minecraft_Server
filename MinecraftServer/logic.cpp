@@ -53,7 +53,7 @@ static std::map<std::string, SavedPosition> savedPositions;
 // ---------------------------------------------------------------------------
 // id : 입장하는 접속자의 슬롯 번호. HandleHello()가 CS_HELLO의 버전을 확인한 뒤 부른다.
 // 넣는 순서
-//   SC_JOIN_OK(id, 시드, 틱 속도, 초기 패킷 총개수) 1개
+//   SC_JOIN_OK(id, 시드, 틱 속도, 초기 패킷 총개수, 재접속 저장 위치) 1개
 //   -> 바뀐 칸마다 SC_BLOCK_CHANGE
 //   -> 기존 플레이어마다 SC_ADD_PLAYER (마지막으로 받은 위치 · 시선 · 이동 모드 · 든 블록)
 // 초기 패킷 총개수 = 바뀐 칸 수 + 기존 플레이어 수. 클라이언트는 이만큼 적용을 마친 뒤 게임을 시작한다 (로딩 진행률).
@@ -62,9 +62,8 @@ static std::map<std::string, SavedPosition> savedPositions;
 // 이 뒤로 이 접속자에게 가는 실시간 변경(블록 변경 · 입퇴장 · 스냅샷)은 같은 송신 버퍼를 거치므로 항상 초기 목록 뒤에 도착한다.
 // 기존 플레이어를 셀 때 자기 자신(id)은 뺀다.
 // v.3의 SendJoinData()에서, 직접 보내지 않고 송신 버퍼에 넣기만 하므로 Send를 Queue로 바꿨다.
+// 저장 위치는 HandleHello()가 players[id]에 채워 둔 것을 담는다 (그때 has_moved가 켜져 있다).
 //
-// 설계안은 SC_JOIN_OK에 재접속 저장 위치도 넣지만, 지금 protocol.h(V2)의 SC_JOIN_OK에는 그 칸이 없어서 넣지 않는다.
-// protocol.h에 칸이 생기면 HandleHello()가 players[id]에 채워 둔 저장 위치를 여기서 SC_JOIN_OK에 담는다.
 // 바뀐 칸이 아주 많으면(1MB / 16바이트 = 약 6만 5천 칸) 입장 데이터만으로 QueuePacket()의 1MB 제한에 걸릴 수 있다.
 void QueueJoinData(int id)
 {
@@ -81,6 +80,12 @@ void QueueJoinData(int id)
     join.seed = seed;
     join.tick_rate = SERVER_TICK_RATE;
     join.initial_packet_count = static_cast<uint32_t>(worldDiff.size()) + existing;
+    if (players[id].has_moved) {   // 재접속 : HandleHello()가 저장 위치를 넣어 두었다
+        join.has_saved_pos = 1;
+        join.saved_x = players[id].state.x;
+        join.saved_y = players[id].state.y;
+        join.saved_z = players[id].state.z;
+    }
     QueuePacket(id, &join);
 
     // 3) 바뀐 칸마다 SC_BLOCK_CHANGE
