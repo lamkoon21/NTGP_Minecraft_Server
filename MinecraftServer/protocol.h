@@ -1,39 +1,14 @@
 ﻿// ============================================================================
 // protocol.h : 서버와 클라이언트가 함께 쓰는 패킷 약속
 // ============================================================================
-// 서버(server.cpp)와 클라이언트(net_client.cpp)가 똑같이 include
+// 서버(server.h)와 클라이언트(net_client.cpp)가 똑같이 include. 고칠 때는 두 저장소의 파일을 같이 고친다
 //
 // 모든 패킷은 [헤더 3바이트][내용] 꼴 
 // 헤더 - 패킷 전체 크기 + 종류
 // 두 패킷이 recv() 한 번에 오거나, 나뉘어 올 수 있다.
 // 그래서 받는 쪽은 헤더의 size를 보고 패킷 하나만큼 잘라 낸다 (ExtractPacket).
 //
-//
-// 패킷 7가지
-//   CS_ : 클라이언트 -> 서버
-//     CS_MOVE_PLAYER    위치, 시선, 든 블록
-//     CS_BLOCK_CHANGE   블록 부수기/놓기
-// 
-//   SC_ : 서버 -> 클라이언트
-//     SC_JOIN_OK        입장 허락. 내 id와 월드 시드
-//     SC_ADD_PLAYER     플레이어 추가(기존 플레이어에게 신규 플레이어, 신규 플레이어에게 기존 플레이어 정보 전송)
-//     SC_REMOVE_PLAYER  다른 플레이어 나감
-//     SC_MOVE_PLAYER    다른 플레이어 움직임 (CS_MOVE_PLAYER 중계)
-//     SC_BLOCK_CHANGE   블록 한 칸 변경 (CS_BLOCK_CHANGE 중계)
-//
-// 게임의 흐름
-//   입장 : 클라 connect() -> 서버 accept()
-//          서버 -> 새 클라   SC_JOIN_OK 1개, SC_BLOCK_CHANGE x 바뀐 칸 수, SC_ADD_PLAYER x 기존 인원(기존 플레이어 정보 추가)
-//          서버 -> 다른 클라 SC_ADD_PLAYER (새 플레이어 정보 추가)
-//   게임 : 클라 CS_MOVE_PLAYER  -> 서버 -> SC_MOVE_PLAYER  -> 보낸 사람을 뺀 클라 (매 틱, 1/60초)
-//          클라 CS_BLOCK_CHANGE -> 서버 -> SC_BLOCK_CHANGE -> 보낸 사람을 포함한 전원
-//   퇴장 : 서버 -> 남은 클라 SC_REMOVE_PLAYER
-//
-// 바이트 순서 : 서버와 클라이언트가 모두 Windows x86/x64(리틀 엔디언)
-//               sockaddr_in에 넣는 포트 번호만 htons()로 바꾼다.
-// ============================================================================
-// 11/ 20일 이후 내용
-// // 패킷 10가지
+// 패킷 10가지
 //   CS_ : 클라이언트 -> 서버
 //     CS_HELLO          프로토콜 버전 전달
 //     CS_MOVE_PLAYER    위치, 시선, 든 블록, 이동 모드
@@ -41,17 +16,17 @@
 //     CS_PING           연결 유지 알림
 //
 //   SC_ : 서버 -> 클라이언트
-//     SC_JOIN_OK        내 ID, 월드 시드, 틱 속도, 초기 패킷 총개수
+//     SC_JOIN_OK        내 ID, 월드 시드, 틱 속도, 초기 패킷 총개수, 재접속 저장 위치
 //     SC_JOIN_REJECT    접속 거절 사유
 //     SC_ADD_PLAYER     플레이어 추가
 //     SC_REMOVE_PLAYER  플레이어 퇴장
 //     SC_SNAPSHOT       서버 틱 번호와 다른 플레이어들의 상태
 //     SC_BLOCK_CHANGE   블록 변경 결과
 //
-// 게임의 흐름 (v2 구현 목표)
+// 게임의 흐름
 //   입장 : 접속 후 클라이언트가 CS_HELLO 전송
 //          서버가 SC_JOIN_OK 또는 SC_JOIN_REJECT 응답
-//          승인 시 초기 SC_BLOCK_CHANGE와 SC_ADD_PLAYER가 뒤따름
+//          승인 시 초기 SC_BLOCK_CHANGE와 SC_ADD_PLAYER가 뒤따르고, 다른 클라이언트에게는 SC_ADD_PLAYER
 //          클라이언트는 초기 패킷을 모두 적용한 뒤 게임 시작
 //
 //   이동 : 클라이언트는 20Hz 간격으로 상태가 바뀌면 CS_MOVE_PLAYER 등록
@@ -62,6 +37,9 @@
 //
 //   유지 : 클라이언트 SendThread가 1초마다 CS_PING 전송
 //   퇴장 : 서버가 남은 클라이언트에게 SC_REMOVE_PLAYER 전달
+//
+// 바이트 순서 : 서버와 클라이언트가 모두 Windows x86/x64(리틀 엔디언)
+//               sockaddr_in에 넣는 포트 번호만 htons()로 바꾼다.
 // ============================================================================
 
 // include guard
@@ -79,13 +57,14 @@
 // 공통 상수
 // ---------------------------------------------------------------------------
 constexpr uint16_t SERVER_PORT = 9000;  // 서버가 listen하는 포트
-constexpr int MAX_PLAYERS = 3;          // 최대 플레이어 정원. 서버의 g_players[MAX_PLAYERS], 플레이어 id는 0 ~ 2
-constexpr int MAX_PACKET_SIZE = 64;     // 패킷 하나의 최대 바이트 수. 가장 큰 SC_ADD_PLAYER(26바이트)보다 넉넉하게 잡았다.
+constexpr int MAX_PLAYERS = 3;          // 최대 플레이어 정원. 서버의 세션 표 g_sessions[MAX_PLAYERS], 플레이어 id는 0 ~ 2
+constexpr int MAX_PACKET_SIZE = 64;     // 패킷 하나의 최대 바이트 수. 가장 큰 SC_SNAPSHOT(54바이트)보다 넉넉하게 잡았다.
                                         // ExtractPacket이 꺼낸 패킷을 담는 배열의 크기이고,
                                         // 헤더의 size가 이보다 크면 깨진 데이터로 본다.
 
 // 공통 상수 추가 - 11/20 
-constexpr uint16_t PROTOCOL_VERSION = 2; // 통신 규약 버전 (서로 같은 패킷 형식을 사용하는 지 확인 용)
+constexpr uint16_t PROTOCOL_VERSION = 3; // 통신 규약 버전 (서로 같은 패킷 형식을 사용하는 지 확인 용)
+                                         // 패킷 형식을 바꾸면 올린다. 11/27 : 3 (SC_JOIN_OK에 재접속 저장 위치 추가)
 constexpr uint8_t SERVER_TICK_RATE = 20;  // 서버의 초당 갱신 횟수 (초당 20번 처리하는 기본 값)
 constexpr int SERVER_TICK_MS = 1000 / SERVER_TICK_RATE; // 50ms (서버 타이머 실행 값)
 
@@ -101,8 +80,7 @@ enum PacketType : uint8_t {
     SC_JOIN_OK       = 3,
     SC_ADD_PLAYER    = 4,
     SC_REMOVE_PLAYER = 5,
-    // v2 전환 중 임시 유지. 스냅샷으로 교체할 때 삭제한다.
-    // SC_MOVE_PLAYER = 6,
+    // 6은 v.3의 SC_MOVE_PLAYER 자리. SC_SNAPSHOT으로 바꿔서 비워 둔다
     SC_BLOCK_CHANGE = 7,
 
     // v2 추가 (버전 확인, 거절 사유 전달, 틱 단위 상태 전달, 연결 감시)
@@ -138,8 +116,8 @@ struct PacketHeader {
     uint8_t  type;  // PacketType 값
 };
 
-// 플레이어 한 명의 움직임 상태 (21바이트)
-// CS_MOVE_PLAYER, SC_MOVE_PLAYER, SC_ADD_PLAYER에 똑같이 들어가므로, 서버는 받은 state를 통째로 저장하고 그대로 중계하면 된다.
+// 플레이어 한 명의 움직임 상태 (22바이트)
+// CS_MOVE_PLAYER, SC_ADD_PLAYER, SC_SNAPSHOT에 똑같이 들어가므로, 서버는 받은 state를 통째로 저장했다가 그대로 보낸다.
 struct PlayerState {
     float x = 0.0f, y = 0.0f, z = 0.0f;  // Character::Position (발 위치, 월드 좌표)
     float yaw = 0.0f;                    // camera.Yaw   (도 단위)
@@ -151,16 +129,16 @@ struct PlayerState {
 };
 
 // ----- 클라이언트 -> 서버 -----
-// CS_MOVE_PLAYER (24바이트) : 매 틱(1/60초) SendMove()가 보낸다. net.Update()가 IdleFunction()의 고정 스텝마다 부름
-// 보낸 사람 id는 넣지 않는다. 서버는 어느 소켓(ClientThread)으로 왔는지 알 수 있음
-// 서버 : g_players[id]에 저장하고, 보낸 사람 이외의 접속자에게 SC_MOVE_PLAYER로 중계
+// CS_MOVE_PLAYER (25바이트) : 클라이언트가 50ms마다 보낸다 (상태가 같으면 생략)
+// 보낸 사람 id는 넣지 않는다. 서버는 어느 소켓(RecvThread)으로 왔는지 알 수 있음
+// 서버 : 값을 확인해 저장하고(HandleMove), 틱마다 SC_SNAPSHOT으로 다른 접속자에게 보낸다
 struct CS_MOVE_PLAYER_PACKET {
     PacketHeader header = { sizeof(CS_MOVE_PLAYER_PACKET), CS_MOVE_PLAYER };
     PlayerState state;
 };
 
-// CS_BLOCK_CHANGE (16바이트) : 블록을 부수거나 놓은 직후 SendBlockChange()가 보낸다.
-// 서버 : 좌표와 종류를 검사하고 g_worldDiff에 기록한 뒤, 보낸 사람을 포함한 전원에게 SC_BLOCK_CHANGE를 보낸다.
+// CS_BLOCK_CHANGE (16바이트) : 블록을 부수거나 놓을 때 보내는 요청. 클라이언트는 SC_BLOCK_CHANGE를 받은 뒤에 바꾼다.
+// 서버 : 좌표와 종류를 검사하고 worldDiff에 기록한 뒤(HandleBlockChange), 보낸 사람을 포함한 전원에게 SC_BLOCK_CHANGE를 보낸다.
 struct CS_BLOCK_CHANGE_PACKET {
     PacketHeader header = { sizeof(CS_BLOCK_CHANGE_PACKET), CS_BLOCK_CHANGE };
     int32_t x = 0;                // 블록 한 칸의 월드 좌표 = 청크 번호 * 16 + 청크 안 칸 번호 (z도 같다)
@@ -174,8 +152,8 @@ struct CS_BLOCK_CHANGE_PACKET {
 
 // ----- 서버 -> 클라이언트 -----
 // 
-// SC_JOIN_OK (8바이트) : 접속하자마자 서버가 맨 먼저 보낸다 (SendJoinData의 첫 패킷).
-// 클라이언트 ConnectServer()는 최대 10초 동안 이 패킷만 받고 header의 type과 size를 확인한다.
+// SC_JOIN_OK (26바이트) : CS_HELLO의 버전이 맞으면 서버가 맨 먼저 보낸다 (QueueJoinData의 첫 패킷).
+// 클라이언트 ConnectThread()는 최대 10초 동안 이 패킷(또는 SC_JOIN_REJECT)만 받고 header의 type과 size를 확인한다.
 // 뒤따라오는 SC_BLOCK_CHANGE, SC_ADD_PLAYER는 소켓에 남아 있다가 RecvThread가 받는다.
 struct SC_JOIN_OK_PACKET {
     PacketHeader header = { sizeof(SC_JOIN_OK_PACKET), SC_JOIN_OK };
@@ -185,17 +163,21 @@ struct SC_JOIN_OK_PACKET {
     // 11/20 추가
     uint8_t tick_rate = SERVER_TICK_RATE; // 서버의 초당 갱신 횟수
     uint32_t initial_packet_count = 0;   // 뒤따르는 초기 패킷 총개수
+
+    // 11/27 추가 - 재접속 저장 위치 : 같은 IP로 나갔던 적이 있으면 그 위치에서 시작한다
+    uint8_t has_saved_pos = 0;    // 1 : 내 캐릭터를 saved_x, y, z에서 시작, 0 : 기본 시작 위치 (아래 값 무시)
+    float saved_x = 0.0f, saved_y = 0.0f, saved_z = 0.0f;  // 나갈 때의 발 위치 (월드 좌표). 시선 · 든 블록은 처음 값으로 시작
 };
 
-// SC_ADD_PLAYER (26바이트) : 원격 플레이어를 만들라는 패킷. 두 경우에 보낸다.
-//   1) 새 접속자에게 : 기존 플레이어마다 1개 (SendJoinData). 서버가 마지막으로 받은 상태를 담는다.
-//   2) 기존 접속자에게 : 방금 들어온 플레이어 1개 (main). 아직 움직인 적이 없으므로 has_moved = 0
+// SC_ADD_PLAYER (27바이트) : 원격 플레이어를 만들라는 패킷. 두 경우에 보낸다.
+//   1) 새 접속자에게 : 기존 플레이어마다 1개 (QueueJoinData). 서버가 마지막으로 받은 상태를 담는다.
+//   2) 기존 접속자에게 : 방금 들어온 플레이어 1개 (HandleHello). 저장 위치에서 시작하면 has_moved = 1, 아니면 0
 // 클라이언트 : 원격 Character를 만들고, has_moved가 1이면 ApplyRemoteState()로 state를 적용한다.
 //              0이면 생성자가 정한 시작 지점에 그대로 둔다.
 struct SC_ADD_PLAYER_PACKET {
     PacketHeader header = { sizeof(SC_ADD_PLAYER_PACKET), SC_ADD_PLAYER };
     uint8_t id = 0;
-    uint8_t has_moved = 0;        // 1 : CS_MOVE_PLAYER를 한 번이라도 보냈다 -> state가 유효하다
+    uint8_t has_moved = 0;        // 1 : CS_MOVE_PLAYER를 한 번이라도 보냈거나 저장 위치에서 시작했다 -> state가 유효하다
                                   // 0 : 아직 보낸 적이 없다 -> state를 무시한다
     PlayerState state;
 };
@@ -211,7 +193,8 @@ struct SnapshotEntry {
 constexpr uint16_t SNAPSHOT_BASE_SIZE =
 sizeof(PacketHeader) + sizeof(uint32_t) + sizeof(uint8_t);
 
-// SC_SNAPSHOT: 서버가 한 틱의 다른 플레이어 상태를 묶어 보낸다.
+// SC_SNAPSHOT: 서버가 한 틱의 다른 플레이어 상태를 묶어 보낸다 (BroadcastSnapshot).
+// 길이가 바뀌는 패킷이다. header.size = SNAPSHOT_BASE_SIZE + count * sizeof(SnapshotEntry)
 struct SC_SNAPSHOT_PACKET {
     PacketHeader header = {
         SNAPSHOT_BASE_SIZE,
@@ -225,25 +208,16 @@ struct SC_SNAPSHOT_PACKET {
     SnapshotEntry players[MAX_PLAYERS - 1]{};
 };
 
-// SC_REMOVE_PLAYER (4바이트) : 누가 나갔다. 남은 접속자에게 보낸다 (ClientThread가 끝날 때).
+// SC_REMOVE_PLAYER (4바이트) : 누가 나갔다. 남은 접속자에게 보낸다 (HandleLeave).
 // 클라이언트 : 그 id의 원격 Character를 지운다.
 struct SC_REMOVE_PLAYER_PACKET {
     PacketHeader header = { sizeof(SC_REMOVE_PLAYER_PACKET), SC_REMOVE_PLAYER };
     uint8_t id = 0;
 };
 
-// SC_MOVE_PLAYER (25바이트) : 서버가 받은 CS_MOVE_PLAYER를 보낸 사람 id만 붙여서 다른 접속자에게 그대로 중계한다.
-// 클라이언트 : 그 id의 원격 Character에 ApplyRemoteState()로 state를 적용한다.
-// 스냅샷으로 전달 기존 코드 주석 처리
-//struct SC_MOVE_PLAYER_PACKET {
-//    PacketHeader header = { sizeof(SC_MOVE_PLAYER_PACKET), SC_MOVE_PLAYER };
-//    uint8_t id = 0;               // 움직인 플레이어
-//    PlayerState state;
-//};
-
 // SC_BLOCK_CHANGE (16바이트) : 블록 한 칸이 바뀌었다. 두 경우에 보낸다.
-//   1) CS_BLOCK_CHANGE 중계 : 보낸 사람까지 전원에게. 그래서 모두가 서버가 받은 순서대로 맞춰진다.
-//   2) 새 접속자에게 : g_worldDiff의 바뀐 칸마다 1개 (SendJoinData)
+//   1) 승인한 CS_BLOCK_CHANGE : 보낸 사람까지 전원에게 (HandleBlockChange). 그래서 모두가 서버가 처리한 순서대로 맞춰진다.
+//   2) 새 접속자에게 : worldDiff의 바뀐 칸마다 1개 (QueueJoinData)
 // 클라이언트 : world->SetBlock(x, y, z, block_type)
 struct SC_BLOCK_CHANGE_PACKET {
     PacketHeader header = { sizeof(SC_BLOCK_CHANGE_PACKET), SC_BLOCK_CHANGE };
@@ -276,7 +250,7 @@ struct SC_JOIN_REJECT_PACKET {
 
 // CS_PING (3바이트): 클라이언트가 연결되어 있음을 알린다.
 // 클라이언트 SendThread가 1초마다 전송한다.
-// 서버는 수신 시 마지막 수신 시각을 갱신한다.
+// 서버 RecvThread는 입력 큐에 넣지 않고 버린다 (무응답 연결은 SO_SNDTIMEO 5분으로 끊는다).
 struct CS_PING_PACKET {
     PacketHeader header = {
         sizeof(CS_PING_PACKET),
@@ -296,11 +270,9 @@ static_assert(sizeof(PacketHeader) == 3, "PacketHeader must be 3 bytes");
 static_assert(sizeof(PlayerState) == 22, "PlayerState must be 22 bytes");
 static_assert(sizeof(CS_MOVE_PLAYER_PACKET) == 25, "CS_MOVE_PLAYER_PACKET must be 25 bytes");
 static_assert(sizeof(CS_BLOCK_CHANGE_PACKET) == 16, "CS_BLOCK_CHANGE_PACKET must be 16 bytes");
-static_assert(sizeof(SC_JOIN_OK_PACKET) == 13, "SC_JOIN_OK_PACKET must be 13 bytes");
+static_assert(sizeof(SC_JOIN_OK_PACKET) == 26, "SC_JOIN_OK_PACKET must be 26 bytes");
 static_assert(sizeof(SC_ADD_PLAYER_PACKET) == 27, "SC_ADD_PLAYER_PACKET must be 27 bytes");
 static_assert(sizeof(SC_REMOVE_PLAYER_PACKET) == 4, "SC_REMOVE_PLAYER_PACKET must be 4 bytes");
-// 11/20일 스냅샷 추가, 기존 SC_MOVE_PLAYER 패킷 비활성화
-//static_assert(sizeof(SC_MOVE_PLAYER_PACKET) == 26, "SC_MOVE_PLAYER_PACKET must be 26 bytes");
 static_assert(sizeof(SC_BLOCK_CHANGE_PACKET) == 16, "SC_BLOCK_CHANGE_PACKET must be 16 bytes");
 static_assert(sizeof(SC_ADD_PLAYER_PACKET) <= MAX_PACKET_SIZE, "every packet must fit in MAX_PACKET_SIZE");
 // 11/20 추가
@@ -317,6 +289,7 @@ static_assert(sizeof(CS_PING_PACKET) == 3, "CS_PING_PACKET must be 3 bytes");
 // ---------------------------------------------------------------------------
 // ExtractPacket : recv()로 쌓아 둔 바이트에서 완성된 패킷 하나를 꺼낸다
 // ---------------------------------------------------------------------------
+// 설계안의 NeedMore · Ok · Corrupt와 같다
 enum ExtractResult {
     EXTRACT_INCOMPLETE,  // 데이터 부족
     EXTRACT_COMPLETE,    // 패킷 하나 추출 완료
@@ -361,7 +334,7 @@ inline ExtractResult ExtractPacket(char* buf, int& len, char* out)
 }
 
 
-// 버퍼 전체 전송
+// 버퍼 전체 전송 (설계안의 SendAll). 송신 버퍼에 이어 붙인 패킷들을 끝까지 보내고, 실패하면 false
 inline bool SendBuffer(SOCKET sock, const void* buffer, int len)
 {
     // 입력값 검사
@@ -389,13 +362,14 @@ inline bool SendBuffer(SOCKET sock, const void* buffer, int len)
 // 반환   : true = 다 보냈다, false = 실패했다 (연결이 끊겼거나 헤더가 잘못됐다)
 //
 // 사용 예 (클라이언트 SendMove)
-//     CS_MOVE_PLAYER_PACKET p;                  // header는 이미 { 24, CS_MOVE_PLAYER }로 채워져 있다
+//     CS_MOVE_PLAYER_PACKET p;                  // header는 이미 { 25, CS_MOVE_PLAYER }로 채워져 있다
 //     p.state.x = player->Position.x;
 //     ...
 //     SendPacket(sock, &p);
 //
 // send()는 요청한 길이보다 적게 보내고 돌아올 수도 있어서, 다 보낼 때까지 반복
-// 같은 소켓에 두 스레드가 동시에 보내면 바이트가 섞일 수 있다. 그래서 서버는 g_cs 안에서만 호출
+// 같은 소켓에 두 스레드가 동시에 보내면 바이트가 섞일 수 있다.
+// 그래서 서버는 Send 스레드가 없는 소켓(RejectConnection)에만 쓰고, 세션의 패킷은 송신 버퍼를 거쳐 SendBuffer()로 보낸다
 inline bool SendPacket(SOCKET sock, const void* packet)
 {
     PacketHeader header;
